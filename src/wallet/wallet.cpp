@@ -5,7 +5,6 @@
 
 #include <wallet/wallet.h>
 
-#include <blockfilter.h>
 #include <chain.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
@@ -126,7 +125,7 @@ bool RemoveWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet
     interfaces::Chain& chain = wallet->chain();
     std::string name = wallet->GetName();
 
-    // Unregister with the validation interface which also drops shared pointers.
+    // Unregister with the validation interface which also drops shared ponters.
     wallet->m_chain_notifications_handler.reset();
     LOCK(context.wallets_mutex);
     std::vector<std::shared_ptr<CWallet>>::iterator i = std::find(context.wallets.begin(), context.wallets.end(), wallet);
@@ -171,7 +170,7 @@ std::unique_ptr<interfaces::Handler> HandleLoadWallet(WalletContext& context, Lo
 {
     LOCK(context.wallets_mutex);
     auto it = context.wallet_load_fns.emplace(context.wallet_load_fns.end(), std::move(load_wallet));
-    return interfaces::MakeCleanupHandler([&context, it] { LOCK(context.wallets_mutex); context.wallet_load_fns.erase(it); });
+    return interfaces::MakeHandler([&context, it] { LOCK(context.wallets_mutex); context.wallet_load_fns.erase(it); });
 }
 
 void NotifyWalletLoaded(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
@@ -262,64 +261,6 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
         return nullptr;
     }
 }
-
-class FastWalletRescanFilter
-{
-public:
-    FastWalletRescanFilter(const CWallet& wallet) : m_wallet(wallet)
-    {
-        // fast rescanning via block filters is only supported by descriptor wallets right now
-        assert(!m_wallet.IsLegacy());
-
-        // create initial filter with scripts from all ScriptPubKeyMans
-        for (auto spkm : m_wallet.GetAllScriptPubKeyMans()) {
-            auto desc_spkm{dynamic_cast<DescriptorScriptPubKeyMan*>(spkm)};
-            assert(desc_spkm != nullptr);
-            AddScriptPubKeys(desc_spkm);
-            // save each range descriptor's end for possible future filter updates
-            if (desc_spkm->IsHDEnabled()) {
-                m_last_range_ends.emplace(desc_spkm->GetID(), desc_spkm->GetEndRange());
-            }
-        }
-    }
-
-    void UpdateIfNeeded()
-    {
-        // repopulate filter with new scripts if top-up has happened since last iteration
-        for (const auto& [desc_spkm_id, last_range_end] : m_last_range_ends) {
-            auto desc_spkm{dynamic_cast<DescriptorScriptPubKeyMan*>(m_wallet.GetScriptPubKeyMan(desc_spkm_id))};
-            assert(desc_spkm != nullptr);
-            int32_t current_range_end{desc_spkm->GetEndRange()};
-            if (current_range_end > last_range_end) {
-                AddScriptPubKeys(desc_spkm, last_range_end);
-                m_last_range_ends.at(desc_spkm->GetID()) = current_range_end;
-            }
-        }
-    }
-
-    std::optional<bool> MatchesBlock(const uint256& block_hash) const
-    {
-        return m_wallet.chain().blockFilterMatchesAny(BlockFilterType::BASIC, block_hash, m_filter_set);
-    }
-
-private:
-    const CWallet& m_wallet;
-    /** Map for keeping track of each range descriptor's last seen end range.
-      * This information is used to detect whether new addresses were derived
-      * (that is, if the current end range is larger than the saved end range)
-      * after processing a block and hence a filter set update is needed to
-      * take possible keypool top-ups into account.
-      */
-    std::map<uint256, int32_t> m_last_range_ends;
-    GCSFilter::ElementSet m_filter_set;
-
-    void AddScriptPubKeys(const DescriptorScriptPubKeyMan* desc_spkm, int32_t last_range_end = 0)
-    {
-        for (const auto& script_pub_key : desc_spkm->GetScriptPubKeys(last_range_end)) {
-            m_filter_set.emplace(script_pub_key.begin(), script_pub_key.end());
-        }
-    }
-};
 } // namespace
 
 std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
@@ -1411,7 +1352,7 @@ void CWallet::blockConnected(const interfaces::BlockInfo& block)
     m_last_block_processed = block.hash;
     for (size_t index = 0; index < block.data->vtx.size(); index++) {
         SyncTransaction(block.data->vtx[index], TxStateConfirmed{block.hash, block.height, static_cast<int>(index)});
-        transactionRemovedFromMempool(block.data->vtx[index], MemPoolRemovalReason::BLOCK, /*mempool_sequence=*/0);
+        transactionRemovedFromMempool(block.data->vtx[index], MemPoolRemovalReason::BLOCK, 0 /* mempool_sequence */);
     }
 }
 
@@ -1814,11 +1755,7 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
     uint256 block_hash = start_block;
     ScanResult result;
 
-    std::unique_ptr<FastWalletRescanFilter> fast_rescan_filter;
-    if (!IsLegacy() && chain().hasBlockFilterIndex(BlockFilterType::BASIC)) fast_rescan_filter = std::make_unique<FastWalletRescanFilter>(*this);
-
-    WalletLogPrintf("Rescan started from block %s... (%s)\n", start_block.ToString(),
-                    fast_rescan_filter ? "fast variant using block filters" : "slow variant inspecting all blocks");
+    WalletLogPrintf("Rescan started from block %s...\n", start_block.ToString());
 
     fAbortRescan = false;
     ShowProgress(strprintf("%s " + _("Rescanning…").translated, GetDisplayName()), 0); // show rescan progress in GUI as dialog or on splashscreen, if rescan required on startup (e.g. due to corruption)
@@ -1845,22 +1782,9 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
             WalletLogPrintf("Still rescanning. At block %d. Progress=%f\n", block_height, progress_current);
         }
 
-        bool fetch_block{true};
-        if (fast_rescan_filter) {
-            fast_rescan_filter->UpdateIfNeeded();
-            auto matches_block{fast_rescan_filter->MatchesBlock(block_hash)};
-            if (matches_block.has_value()) {
-                if (*matches_block) {
-                    LogPrint(BCLog::SCAN, "Fast rescan: inspect block %d [%s] (filter matched)\n", block_height, block_hash.ToString());
-                } else {
-                    result.last_scanned_block = block_hash;
-                    result.last_scanned_height = block_height;
-                    fetch_block = false;
-                }
-            } else {
-                LogPrint(BCLog::SCAN, "Fast rescan: inspect block %d [%s] (WARNING: block filter not found!)\n", block_height, block_hash.ToString());
-            }
-        }
+        // Read block data
+        CBlock block;
+        chain().findBlock(block_hash, FoundBlock().data(block));
 
         // Find next block separately from reading data above, because reading
         // is slow and there might be a reorg while it is read.
@@ -1869,41 +1793,35 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
         uint256 next_block_hash;
         chain().findBlock(block_hash, FoundBlock().inActiveChain(block_still_active).nextBlock(FoundBlock().inActiveChain(next_block).hash(next_block_hash)));
 
-        if (fetch_block) {
-            // Read block data
-            CBlock block;
-            chain().findBlock(block_hash, FoundBlock().data(block));
-
-            if (!block.IsNull()) {
-                LOCK(cs_wallet);
-                if (!block_still_active) {
-                    // Abort scan if current block is no longer active, to prevent
-                    // marking transactions as coming from the wrong block.
-                    result.last_failed_block = block_hash;
-                    result.status = ScanResult::FAILURE;
-                    break;
-                }
-                for (size_t posInBlock = 0; posInBlock < block.vtx.size(); ++posInBlock) {
-                    SyncTransaction(block.vtx[posInBlock], TxStateConfirmed{block_hash, block_height, static_cast<int>(posInBlock)}, fUpdate, /*rescanning_old_block=*/true);
-                }
-                // scan succeeded, record block as most recent successfully scanned
-                result.last_scanned_block = block_hash;
-                result.last_scanned_height = block_height;
-
-                if (save_progress && next_interval) {
-                    CBlockLocator loc = m_chain->getActiveChainLocator(block_hash);
-
-                    if (!loc.IsNull()) {
-                        WalletLogPrintf("Saving scan progress %d.\n", block_height);
-                        WalletBatch batch(GetDatabase());
-                        batch.WriteBestBlock(loc);
-                    }
-                }
-            } else {
-                // could not scan block, keep scanning but record this block as the most recent failure
+        if (!block.IsNull()) {
+            LOCK(cs_wallet);
+            if (!block_still_active) {
+                // Abort scan if current block is no longer active, to prevent
+                // marking transactions as coming from the wrong block.
                 result.last_failed_block = block_hash;
                 result.status = ScanResult::FAILURE;
+                break;
             }
+            for (size_t posInBlock = 0; posInBlock < block.vtx.size(); ++posInBlock) {
+                SyncTransaction(block.vtx[posInBlock], TxStateConfirmed{block_hash, block_height, static_cast<int>(posInBlock)}, fUpdate, /*rescanning_old_block=*/true);
+            }
+            // scan succeeded, record block as most recent successfully scanned
+            result.last_scanned_block = block_hash;
+            result.last_scanned_height = block_height;
+
+            if (save_progress && next_interval) {
+                CBlockLocator loc = m_chain->getActiveChainLocator(block_hash);
+
+                if (!loc.IsNull()) {
+                    WalletLogPrintf("Saving scan progress %d.\n", block_height);
+                    WalletBatch batch(GetDatabase());
+                    batch.WriteBestBlock(loc);
+                }
+            }
+        } else {
+            // could not scan block, keep scanning but record this block as the most recent failure
+            result.last_failed_block = block_hash;
+            result.status = ScanResult::FAILURE;
         }
         if (max_height && block_height >= *max_height) {
             break;
@@ -1998,12 +1916,12 @@ bool CWallet::ShouldResend() const
 
     // Do this infrequently and randomly to avoid giving away
     // that these are our transactions.
-    if (NodeClock::now() < m_next_resend) return false;
+    if (GetTime() < m_next_resend) return false;
 
     return true;
 }
 
-NodeClock::time_point CWallet::GetDefaultNextResend() { return FastRandomContext{}.rand_uniform_delay(NodeClock::now() + 12h, 24h); }
+int64_t CWallet::GetDefaultNextResend() { return GetTime() + (12 * 60 * 60) + GetRand(24 * 60 * 60); }
 
 // Resubmit transactions from the wallet to the mempool, optionally asking the
 // mempool to relay them. On startup, we will do this for all unconfirmed
@@ -2047,7 +1965,7 @@ void CWallet::ResubmitWalletTransactions(bool relay, bool force)
             // Only rebroadcast unconfirmed txs
             if (!wtx.isUnconfirmed()) continue;
 
-            // Attempt to rebroadcast all txes more than 5 minutes older than
+            // attempt to rebroadcast all txes more than 5 minutes older than
             // the last block, or all txs if forcing.
             if (!force && wtx.nTimeReceived > m_best_block_time - 5 * 60) continue;
             to_submit.insert(&wtx);
@@ -2463,11 +2381,12 @@ bool CWallet::TopUpKeyPool(unsigned int kpSize)
 util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType type, const std::string label)
 {
     LOCK(cs_wallet);
-    auto spk_man = GetScriptPubKeyMan(type, /*internal=*/false);
+    auto spk_man = GetScriptPubKeyMan(type, false /* internal */);
     if (!spk_man) {
         return util::Error{strprintf(_("Error: No %s addresses available."), FormatOutputType(type))};
     }
 
+    spk_man->TopUp();
     auto op_dest = spk_man->GetNewDestination(type);
     if (op_dest) {
         SetAddressBook(*op_dest, label, "receive");
@@ -2561,7 +2480,10 @@ util::Result<CTxDestination> ReserveDestination::GetReservedDestination(bool int
         return util::Error{strprintf(_("Error: No %s addresses available."), FormatOutputType(type))};
     }
 
-    if (nIndex == -1) {
+    if (nIndex == -1)
+    {
+        m_spk_man->TopUp();
+
         CKeyPool keypool;
         auto op_address = m_spk_man->GetReservedDestination(type, internal, nIndex, keypool);
         if (!op_address) return op_address;
@@ -2919,10 +2841,6 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
                                 "The wallet might had been created on a newer version.\n"
                                 "Please try running the latest software version.\n"), walletFile);
             return nullptr;
-        } else if (nLoadWalletRet == DBErrors::UNEXPECTED_LEGACY_ENTRY) {
-            error = strprintf(_("Unexpected legacy entry in descriptor wallet found. Loading wallet %s\n\n"
-                                "The wallet might have been tampered with or created with malicious intent.\n"), walletFile);
-            return nullptr;
         } else {
             error = strprintf(_("Error loading %s"), walletFile);
             return nullptr;
@@ -3203,14 +3121,12 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
                 // If a block is pruned after this check, we will load the wallet,
                 // but fail the rescan with a generic error.
 
-                error = chain.havePruned() ?
-                     _("Prune: last wallet synchronisation goes beyond pruned data. You need to -reindex (download the whole blockchain again in case of pruned node)") :
-                     strprintf(_(
-                        "Error loading wallet. Wallet requires blocks to be downloaded, "
-                        "and software does not currently support loading wallets while "
-                        "blocks are being downloaded out of order when using assumeutxo "
-                        "snapshots. Wallet should be able to load successfully after "
-                        "node sync reaches height %s"), block_height);
+                error = chain.hasAssumedValidChain() ?
+                     _(
+                        "Assumed-valid: last wallet synchronisation goes beyond "
+                        "available block data. You need to wait for the background "
+                        "validation chain to download more blocks.") :
+                     _("Prune: last wallet synchronisation goes beyond pruned data. You need to -reindex (download the whole blockchain again in case of pruned node)");
                 return false;
             }
         }

@@ -2,13 +2,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <algorithm>
 #include <consensus/amount.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
-#include <numeric>
 #include <policy/policy.h>
-#include <primitives/transaction.h>
 #include <script/signingprovider.h>
 #include <util/check.h>
 #include <util/fees.h>
@@ -105,17 +102,11 @@ void CoinsResult::Clear() {
     coins.clear();
 }
 
-void CoinsResult::Erase(const std::unordered_set<COutPoint, SaltedOutpointHasher>& coins_to_remove)
+void CoinsResult::Erase(const std::set<COutPoint>& coins_to_remove)
 {
     for (auto& [type, vec] : coins) {
         auto remove_it = std::remove_if(vec.begin(), vec.end(), [&](const COutput& coin) {
-            // remove it if it's on the set
-            if (coins_to_remove.count(coin.outpoint) == 0) return false;
-
-            // update cached amounts
-            total_amount -= coin.txout.nValue;
-            if (coin.HasEffectiveValue()) total_effective_amount = *total_effective_amount - coin.GetEffectiveValue();
-            return true;
+            return coins_to_remove.count(coin.outpoint) == 1;
         });
         vec.erase(remove_it, vec.end());
     }
@@ -131,11 +122,6 @@ void CoinsResult::Shuffle(FastRandomContext& rng_fast)
 void CoinsResult::Add(OutputType type, const COutput& out)
 {
     coins[type].emplace_back(out);
-    total_amount += out.txout.nValue;
-    if (out.HasEffectiveValue()) {
-        total_effective_amount = total_effective_amount.has_value() ?
-                *total_effective_amount + out.GetEffectiveValue() : out.GetEffectiveValue();
-    }
 }
 
 static OutputType GetOutputType(TxoutType type, bool is_from_p2sh)
@@ -155,55 +141,14 @@ static OutputType GetOutputType(TxoutType type, bool is_from_p2sh)
     }
 }
 
-// Fetch and validate the coin control selected inputs.
-// Coins could be internal (from the wallet) or external.
-util::Result<PreSelectedInputs> FetchSelectedInputs(const CWallet& wallet, const CCoinControl& coin_control,
-                                            const CoinSelectionParams& coin_selection_params) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
-{
-    PreSelectedInputs result;
-    std::vector<COutPoint> vPresetInputs;
-    coin_control.ListSelected(vPresetInputs);
-    for (const COutPoint& outpoint : vPresetInputs) {
-        int input_bytes = -1;
-        CTxOut txout;
-        if (auto ptr_wtx = wallet.GetWalletTx(outpoint.hash)) {
-            // Clearly invalid input, fail
-            if (ptr_wtx->tx->vout.size() <= outpoint.n) {
-                return util::Error{strprintf(_("Invalid pre-selected input %s"), outpoint.ToString())};
-            }
-            txout = ptr_wtx->tx->vout.at(outpoint.n);
-            input_bytes = CalculateMaximumSignedInputSize(txout, &wallet, &coin_control);
-        } else {
-            // The input is external. We did not find the tx in mapWallet.
-            if (!coin_control.GetExternalOutput(outpoint, txout)) {
-                return util::Error{strprintf(_("Not found pre-selected input %s"), outpoint.ToString())};
-            }
-        }
-
-        if (input_bytes == -1) {
-            input_bytes = CalculateMaximumSignedInputSize(txout, outpoint, &coin_control.m_external_provider, &coin_control);
-        }
-
-        // If available, override calculated size with coin control specified size
-        if (coin_control.HasInputWeight(outpoint)) {
-            input_bytes = GetVirtualTransactionSize(coin_control.GetInputWeight(outpoint), 0, 0);
-        }
-
-        if (input_bytes == -1) {
-            return util::Error{strprintf(_("Not solvable pre-selected input %s"), outpoint.ToString())}; // Not solvable, can't estimate size for fee
-        }
-
-        /* Set some defaults for depth, spendable, solvable, safe, time, and from_me as these don't matter for preset inputs since no selection is being done. */
-        COutput output(outpoint, txout, /*depth=*/ 0, input_bytes, /*spendable=*/ true, /*solvable=*/ true, /*safe=*/ true, /*time=*/ 0, /*from_me=*/ false, coin_selection_params.m_effective_feerate);
-        result.Insert(output, coin_selection_params.m_subtract_fee_outputs);
-    }
-    return result;
-}
-
 CoinsResult AvailableCoins(const CWallet& wallet,
                            const CCoinControl* coinControl,
                            std::optional<CFeeRate> feerate,
-                           const CoinFilterParams& params)
+                           const CAmount& nMinimumAmount,
+                           const CAmount& nMaximumAmount,
+                           const CAmount& nMinimumSumAmount,
+                           const uint64_t nMaximumCount,
+                           bool only_spendable)
 {
     AssertLockHeld(wallet.cs_wallet);
 
@@ -221,7 +166,7 @@ CoinsResult AvailableCoins(const CWallet& wallet,
         const uint256& wtxid = entry.first;
         const CWalletTx& wtx = entry.second;
 
-        if (wallet.IsTxImmatureCoinBase(wtx) && !params.include_immature_coinbase)
+        if (wallet.IsTxImmatureCoinBase(wtx))
             continue;
 
         int nDepth = wallet.GetTxDepthInMainChain(wtx);
@@ -280,11 +225,10 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             const CTxOut& output = wtx.tx->vout[i];
             const COutPoint outpoint(wtxid, i);
 
-            if (output.nValue < params.min_amount || output.nValue > params.max_amount)
+            if (output.nValue < nMinimumAmount || output.nValue > nMaximumAmount)
                 continue;
 
-            // Skip manually selected coins (the caller can fetch them directly)
-            if (coinControl && coinControl->HasSelected() && coinControl->IsSelected(outpoint))
+            if (coinControl && coinControl->HasSelected() && !coinControl->m_allow_other_inputs && !coinControl->IsSelected(outpoint))
                 continue;
 
             if (wallet.IsLockedCoin(outpoint))
@@ -312,36 +256,46 @@ CoinsResult AvailableCoins(const CWallet& wallet,
             bool spendable = ((mine & ISMINE_SPENDABLE) != ISMINE_NO) || (((mine & ISMINE_WATCH_ONLY) != ISMINE_NO) && (coinControl && coinControl->fAllowWatchOnly && solvable));
 
             // Filter by spendable outputs only
-            if (!spendable && params.only_spendable) continue;
+            if (!spendable && only_spendable) continue;
 
-            // Obtain script type
-            std::vector<std::vector<uint8_t>> script_solutions;
-            TxoutType type = Solver(output.scriptPubKey, script_solutions);
-
-            // If the output is P2SH and solvable, we want to know if it is
+            // If the Output is P2SH and spendable, we want to know if it is
             // a P2SH (legacy) or one of P2SH-P2WPKH, P2SH-P2WSH (P2SH-Segwit). We can determine
-            // this from the redeemScript. If the output is not solvable, it will be classified
+            // this from the redeemScript. If the Output is not spendable, it will be classified
             // as a P2SH (legacy), since we have no way of knowing otherwise without the redeemScript
+            CScript script;
             bool is_from_p2sh{false};
-            if (type == TxoutType::SCRIPTHASH && solvable) {
-                CScript script;
-                if (!provider->GetCScript(CScriptID(uint160(script_solutions[0])), script)) continue;
-                type = Solver(script, script_solutions);
+            if (output.scriptPubKey.IsPayToScriptHash() && solvable) {
+                CTxDestination destination;
+                if (!ExtractDestination(output.scriptPubKey, destination))
+                    continue;
+                const CScriptID& hash = CScriptID(std::get<ScriptHash>(destination));
+                if (!provider->GetCScript(hash, script))
+                    continue;
                 is_from_p2sh = true;
+            } else {
+                script = output.scriptPubKey;
             }
 
-            result.Add(GetOutputType(type, is_from_p2sh),
-                       COutput(outpoint, output, nDepth, input_bytes, spendable, solvable, safeTx, wtx.GetTxTime(), tx_from_me, feerate));
+            COutput coin(outpoint, output, nDepth, input_bytes, spendable, solvable, safeTx, wtx.GetTxTime(), tx_from_me, feerate);
 
+            // When parsing a scriptPubKey, Solver returns the parsed pubkeys or hashes (depending on the script)
+            // We don't need those here, so we are leaving them in return_values_unused
+            std::vector<std::vector<uint8_t>> return_values_unused;
+            TxoutType type;
+            type = Solver(script, return_values_unused);
+            result.Add(GetOutputType(type, is_from_p2sh), coin);
+
+            // Cache total amount as we go
+            result.total_amount += output.nValue;
             // Checks the sum amount of all UTXO's.
-            if (params.min_sum_amount != MAX_MONEY) {
-                if (result.GetTotalAmount() >= params.min_sum_amount) {
+            if (nMinimumSumAmount != MAX_MONEY) {
+                if (result.total_amount >= nMinimumSumAmount) {
                     return result;
                 }
             }
 
             // Checks the maximum number of UTXO's.
-            if (params.max_count > 0 && result.Size() >= params.max_count) {
+            if (nMaximumCount > 0 && result.Size() >= nMaximumCount) {
                 return result;
             }
         }
@@ -350,16 +304,21 @@ CoinsResult AvailableCoins(const CWallet& wallet,
     return result;
 }
 
-CoinsResult AvailableCoinsListUnspent(const CWallet& wallet, const CCoinControl* coinControl, CoinFilterParams params)
+CoinsResult AvailableCoinsListUnspent(const CWallet& wallet, const CCoinControl* coinControl, const CAmount& nMinimumAmount, const CAmount& nMaximumAmount, const CAmount& nMinimumSumAmount, const uint64_t nMaximumCount)
 {
-    params.only_spendable = false;
-    return AvailableCoins(wallet, coinControl, /*feerate=*/ std::nullopt, params);
+    return AvailableCoins(wallet, coinControl, /*feerate=*/ std::nullopt, nMinimumAmount, nMaximumAmount, nMinimumSumAmount, nMaximumCount, /*only_spendable=*/false);
 }
 
 CAmount GetAvailableBalance(const CWallet& wallet, const CCoinControl* coinControl)
 {
     LOCK(wallet.cs_wallet);
-    return AvailableCoins(wallet, coinControl).GetTotalAmount();
+    return AvailableCoins(wallet, coinControl,
+            /*feerate=*/ std::nullopt,
+            /*nMinimumAmount=*/ 1,
+            /*nMaximumAmount=*/ MAX_MONEY,
+            /*nMinimumSumAmount=*/ MAX_MONEY,
+            /*nMaximumCount=*/ 0
+    ).total_amount;
 }
 
 const CTxOut& FindNonChangeParentOutput(const CWallet& wallet, const CTransaction& tx, int output)
@@ -525,9 +484,8 @@ std::optional<SelectionResult> AttemptSelection(const CWallet& wallet, const CAm
     if (results.size() > 0) return *std::min_element(results.begin(), results.end());
 
     // If we can't fund the transaction from any individual OutputType, run coin selection one last time
-    // over all available coins, which would allow mixing.
-    // If TypesCount() <= 1, there is nothing to mix.
-    if (allow_mixed_output_types && available_coins.TypesCount() > 1) {
+    // over all available coins, which would allow mixing
+    if (allow_mixed_output_types) {
         if (auto result{ChooseSelectionResult(wallet, nTargetValue, eligibility_filter, available_coins.All(), coin_selection_params)}) {
             return result;
         }
@@ -559,71 +517,93 @@ std::optional<SelectionResult> ChooseSelectionResult(const CWallet& wallet, cons
         results.push_back(*srd_result);
     }
 
-    if (results.empty()) {
+    if (results.size() == 0) {
         // No solution found
-        return std::nullopt;
-    }
-
-    std::vector<SelectionResult> eligible_results;
-    std::copy_if(results.begin(), results.end(), std::back_inserter(eligible_results), [coin_selection_params](const SelectionResult& result) {
-        const auto initWeight{coin_selection_params.tx_noinputs_size * WITNESS_SCALE_FACTOR};
-        return initWeight + result.GetWeight() <= static_cast<int>(MAX_STANDARD_TX_WEIGHT);
-    });
-
-    if (eligible_results.empty()) {
         return std::nullopt;
     }
 
     // Choose the result with the least waste
     // If the waste is the same, choose the one which spends more inputs.
-    auto& best_result = *std::min_element(eligible_results.begin(), eligible_results.end());
+    auto& best_result = *std::min_element(results.begin(), results.end());
     return best_result;
 }
 
-std::optional<SelectionResult> SelectCoins(const CWallet& wallet, CoinsResult& available_coins, const PreSelectedInputs& pre_set_inputs,
-                                           const CAmount& nTargetValue, const CCoinControl& coin_control,
-                                           const CoinSelectionParams& coin_selection_params)
+std::optional<SelectionResult> SelectCoins(const CWallet& wallet, CoinsResult& available_coins, const CAmount& nTargetValue, const CCoinControl& coin_control, const CoinSelectionParams& coin_selection_params)
 {
-    // Deduct preset inputs amount from the search target
-    CAmount selection_target = nTargetValue - pre_set_inputs.total_amount;
+    CAmount value_to_select = nTargetValue;
 
-    // Return if automatic coin selection is disabled, and we don't cover the selection target
-    if (!coin_control.m_allow_other_inputs && selection_target > 0) return std::nullopt;
+    OutputGroup preset_inputs(coin_selection_params);
 
-    // Return if we can cover the target only with the preset inputs
-    if (selection_target <= 0) {
+    // calculate value from preset inputs and store them
+    std::set<COutPoint> preset_coins;
+
+    std::vector<COutPoint> vPresetInputs;
+    coin_control.ListSelected(vPresetInputs);
+    for (const COutPoint& outpoint : vPresetInputs) {
+        int input_bytes = -1;
+        CTxOut txout;
+        auto ptr_wtx = wallet.GetWalletTx(outpoint.hash);
+        if (ptr_wtx) {
+            // Clearly invalid input, fail
+            if (ptr_wtx->tx->vout.size() <= outpoint.n) {
+                return std::nullopt;
+            }
+            txout = ptr_wtx->tx->vout.at(outpoint.n);
+            input_bytes = CalculateMaximumSignedInputSize(txout, &wallet, &coin_control);
+        } else {
+            // The input is external. We did not find the tx in mapWallet.
+            if (!coin_control.GetExternalOutput(outpoint, txout)) {
+                return std::nullopt;
+            }
+        }
+
+        if (input_bytes == -1) {
+            input_bytes = CalculateMaximumSignedInputSize(txout, outpoint, &coin_control.m_external_provider, &coin_control);
+        }
+
+        // If available, override calculated size with coin control specified size
+        if (coin_control.HasInputWeight(outpoint)) {
+            input_bytes = GetVirtualTransactionSize(coin_control.GetInputWeight(outpoint), 0, 0);
+        }
+
+        if (input_bytes == -1) {
+            return std::nullopt; // Not solvable, can't estimate size for fee
+        }
+
+        /* Set some defaults for depth, spendable, solvable, safe, time, and from_me as these don't matter for preset inputs since no selection is being done. */
+        COutput output(outpoint, txout, /*depth=*/ 0, input_bytes, /*spendable=*/ true, /*solvable=*/ true, /*safe=*/ true, /*time=*/ 0, /*from_me=*/ false, coin_selection_params.m_effective_feerate);
+        if (coin_selection_params.m_subtract_fee_outputs) {
+            value_to_select -= output.txout.nValue;
+        } else {
+            value_to_select -= output.GetEffectiveValue();
+        }
+        preset_coins.insert(outpoint);
+        /* Set ancestors and descendants to 0 as they don't matter for preset inputs since no actual selection is being done.
+         * positive_only is set to false because we want to include all preset inputs, even if they are dust.
+         */
+        preset_inputs.Insert(output, /*ancestors=*/ 0, /*descendants=*/ 0, /*positive_only=*/ false);
+    }
+
+    // coin control -> return all selected outputs (we want all selected to go into the transaction for sure)
+    if (coin_control.HasSelected() && !coin_control.m_allow_other_inputs) {
         SelectionResult result(nTargetValue, SelectionAlgorithm::MANUAL);
-        result.AddInputs(pre_set_inputs.coins, coin_selection_params.m_subtract_fee_outputs);
+        result.AddInput(preset_inputs);
+
+        if (!coin_selection_params.m_subtract_fee_outputs && result.GetSelectedEffectiveValue() < nTargetValue) {
+            return std::nullopt;
+        } else if (result.GetSelectedValue() < nTargetValue) {
+            return std::nullopt;
+        }
+
         result.ComputeAndSetWaste(coin_selection_params.min_viable_change, coin_selection_params.m_cost_of_change, coin_selection_params.m_change_fee);
         return result;
     }
 
-    // Return early if we cannot cover the target with the wallet's UTXO.
-    // We use the total effective value if we are not subtracting fee from outputs and 'available_coins' contains the data.
-    CAmount available_coins_total_amount = coin_selection_params.m_subtract_fee_outputs ? available_coins.GetTotalAmount() :
-            (available_coins.GetEffectiveTotalAmount().has_value() ? *available_coins.GetEffectiveTotalAmount() : 0);
-    if (selection_target > available_coins_total_amount) {
-        return std::nullopt; // Insufficient funds
+    // remove preset inputs from coins so that Coin Selection doesn't pick them.
+    if (coin_control.HasSelected()) {
+        available_coins.Erase(preset_coins);
     }
 
-    // Start wallet Coin Selection procedure
-    auto op_selection_result = AutomaticCoinSelection(wallet, available_coins, selection_target, coin_control, coin_selection_params);
-    if (!op_selection_result) return op_selection_result;
-
-    // If needed, add preset inputs to the automatic coin selection result
-    if (!pre_set_inputs.coins.empty()) {
-        SelectionResult preselected(pre_set_inputs.total_amount, SelectionAlgorithm::MANUAL);
-        preselected.AddInputs(pre_set_inputs.coins, coin_selection_params.m_subtract_fee_outputs);
-        op_selection_result->Merge(preselected);
-        op_selection_result->ComputeAndSetWaste(coin_selection_params.min_viable_change,
-                                                coin_selection_params.m_cost_of_change,
-                                                coin_selection_params.m_change_fee);
-    }
-    return op_selection_result;
-}
-
-std::optional<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, CoinsResult& available_coins, const CAmount& value_to_select, const CCoinControl& coin_control, const CoinSelectionParams& coin_selection_params)
-{
     unsigned int limit_ancestor_count = 0;
     unsigned int limit_descendant_count = 0;
     wallet.chain().getPackageLimits(limit_ancestor_count, limit_descendant_count);
@@ -640,10 +620,16 @@ std::optional<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coi
         available_coins.Shuffle(coin_selection_params.rng_fast);
     }
 
+    SelectionResult preselected(preset_inputs.GetSelectionAmount(), SelectionAlgorithm::MANUAL);
+    preselected.AddInput(preset_inputs);
+
     // Coin Selection attempts to select inputs from a pool of eligible UTXOs to fund the
     // transaction at a target feerate. If an attempt fails, more attempts may be made using a more
     // permissive CoinEligibilityFilter.
     std::optional<SelectionResult> res = [&] {
+        // Pre-selected inputs already cover the target amount.
+        if (value_to_select <= 0) return std::make_optional(SelectionResult(value_to_select, SelectionAlgorithm::MANUAL));
+
         // If possible, fund the transaction with confirmed UTXOs only. Prefer at least six
         // confirmations on outputs received from other wallets and only spend confirmed change.
         if (auto r1{AttemptSelection(wallet, value_to_select, CoinEligibilityFilter(1, 6, 0), available_coins, coin_selection_params, /*allow_mixed_output_types=*/false)}) return r1;
@@ -665,7 +651,7 @@ std::optional<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coi
             // If partial groups are allowed, relax the requirement of spending OutputGroups (groups
             // of UTXOs sent to the same address, which are obviously controlled by a single wallet)
             // in their entirety.
-            if (auto r6{AttemptSelection(wallet, value_to_select, CoinEligibilityFilter(0, 1, max_ancestors-1, max_descendants-1, /*include_partial=*/true),
+            if (auto r6{AttemptSelection(wallet, value_to_select, CoinEligibilityFilter(0, 1, max_ancestors-1, max_descendants-1, true /* include_partial_groups */),
                                    available_coins, coin_selection_params, /*allow_mixed_output_types=*/true)}) {
                 return r6;
             }
@@ -673,7 +659,7 @@ std::optional<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coi
             // received from other wallets.
             if (coin_control.m_include_unsafe_inputs) {
                 if (auto r7{AttemptSelection(wallet, value_to_select,
-                    CoinEligibilityFilter(/*conf_mine=*/0, /*conf_theirs=*/0, max_ancestors-1, max_descendants-1, /*include_partial=*/true),
+                    CoinEligibilityFilter(0 /* conf_mine */, 0 /* conf_theirs */, max_ancestors-1, max_descendants-1, true /* include_partial_groups */),
                     available_coins, coin_selection_params, /*allow_mixed_output_types=*/true)}) {
                     return r7;
                 }
@@ -683,7 +669,7 @@ std::optional<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coi
             // OutputGroups use heuristics that may overestimate ancestor/descendant counts.
             if (!fRejectLongChains) {
                 if (auto r8{AttemptSelection(wallet, value_to_select,
-                                      CoinEligibilityFilter(0, 1, std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max(), /*include_partial=*/true),
+                                      CoinEligibilityFilter(0, 1, std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max(), true /* include_partial_groups */),
                                       available_coins, coin_selection_params, /*allow_mixed_output_types=*/true)}) {
                     return r8;
                 }
@@ -692,6 +678,14 @@ std::optional<SelectionResult> AutomaticCoinSelection(const CWallet& wallet, Coi
         // Coin Selection failed.
         return std::optional<SelectionResult>();
     }();
+
+    if (!res) return std::nullopt;
+
+    // Add preset inputs to result
+    res->Merge(preselected);
+    if (res->GetAlgo() == SelectionAlgorithm::MANUAL) {
+        res->ComputeAndSetWaste(coin_selection_params.min_viable_change, coin_selection_params.m_cost_of_change, coin_selection_params.m_change_fee);
+    }
 
     return res;
 }
@@ -780,6 +774,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     AssertLockHeld(wallet.cs_wallet);
 
     // out variables, to be packed into returned result structure
+    CAmount nFeeRet;
     int nChangePosInOut = change_pos;
 
     FastRandomContext rng_fast;
@@ -880,16 +875,19 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     const auto change_spend_fee = coin_selection_params.m_discard_feerate.GetFee(coin_selection_params.change_spend_size);
     coin_selection_params.min_viable_change = std::max(change_spend_fee + 1, dust);
 
-    // Static vsize overhead + outputs vsize. 4 nVersion, 4 nLocktime, 1 input count, 1 witness overhead (dummy, flag, stack size)
-    coin_selection_params.tx_noinputs_size = 10 + GetSizeOfCompactSize(vecSend.size()); // bytes for output count
-
     // vouts to the payees
+    if (!coin_selection_params.m_subtract_fee_outputs) {
+        coin_selection_params.tx_noinputs_size = 10; // Static vsize overhead + outputs vsize. 4 nVersion, 4 nLocktime, 1 input count, 1 witness overhead (dummy, flag, stack size)
+        coin_selection_params.tx_noinputs_size += GetSizeOfCompactSize(vecSend.size()); // bytes for output count
+    }
     for (const auto& recipient : vecSend)
     {
         CTxOut txout(recipient.nAmount, recipient.scriptPubKey);
 
         // Include the fee cost for outputs.
-        coin_selection_params.tx_noinputs_size += ::GetSerializeSize(txout, PROTOCOL_VERSION);
+        if (!coin_selection_params.m_subtract_fee_outputs) {
+            coin_selection_params.tx_noinputs_size += ::GetSerializeSize(txout, PROTOCOL_VERSION);
+        }
 
         if (IsDust(txout, wallet.chain().relayDustFee())) {
             return util::Error{_("Transaction amount too small")};
@@ -898,26 +896,20 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     }
 
     // Include the fees for things that aren't inputs, excluding the change output
-    const CAmount not_input_fees = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.m_subtract_fee_outputs ? 0 : coin_selection_params.tx_noinputs_size);
+    const CAmount not_input_fees = coin_selection_params.m_effective_feerate.GetFee(coin_selection_params.tx_noinputs_size);
     CAmount selection_target = recipients_sum + not_input_fees;
 
-    // Fetch manually selected coins
-    PreSelectedInputs preset_inputs;
-    if (coin_control.HasSelected()) {
-        auto res_fetch_inputs = FetchSelectedInputs(wallet, coin_control, coin_selection_params);
-        if (!res_fetch_inputs) return util::Error{util::ErrorString(res_fetch_inputs)};
-        preset_inputs = *res_fetch_inputs;
-    }
-
-    // Fetch wallet available coins if "other inputs" are
-    // allowed (coins automatically selected by the wallet)
-    CoinsResult available_coins;
-    if (coin_control.m_allow_other_inputs) {
-        available_coins = AvailableCoins(wallet, &coin_control, coin_selection_params.m_effective_feerate);
-    }
+    // Get available coins
+    auto available_coins = AvailableCoins(wallet,
+                                              &coin_control,
+                                              coin_selection_params.m_effective_feerate,
+                                              1,            /*nMinimumAmount*/
+                                              MAX_MONEY,    /*nMaximumAmount*/
+                                              MAX_MONEY,    /*nMinimumSumAmount*/
+                                              0);           /*nMaximumCount*/
 
     // Choose coins to use
-    std::optional<SelectionResult> result = SelectCoins(wallet, available_coins, preset_inputs, /*nTargetValue=*/selection_target, coin_control, coin_selection_params);
+    std::optional<SelectionResult> result = SelectCoins(wallet, available_coins, /*nTargetValue=*/selection_target, coin_control, coin_selection_params);
     if (!result) {
         return util::Error{_("Insufficient funds")};
     }
@@ -961,28 +953,22 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         return util::Error{_("Missing solving data for estimating transaction size")};
     }
     CAmount fee_needed = coin_selection_params.m_effective_feerate.GetFee(nBytes);
-    const CAmount output_value = CalculateOutputValue(txNew);
-    Assume(recipients_sum + change_amount == output_value);
-    CAmount current_fee = result->GetSelectedValue() - output_value;
+    nFeeRet = result->GetSelectedValue() - recipients_sum - change_amount;
 
-    // Sanity check that the fee cannot be negative as that means we have more output value than input value
-    if (current_fee < 0) {
-        return util::Error{Untranslated(STR_INTERNAL_BUG("Fee paid < 0"))};
-    }
+    // The only time that fee_needed should be less than the amount available for fees is when
+    // we are subtracting the fee from the outputs. If this occurs at any other time, it is a bug.
+    assert(coin_selection_params.m_subtract_fee_outputs || fee_needed <= nFeeRet);
 
     // If there is a change output and we overpay the fees then increase the change to match the fee needed
-    if (nChangePosInOut != -1 && fee_needed < current_fee) {
+    if (nChangePosInOut != -1 && fee_needed < nFeeRet) {
         auto& change = txNew.vout.at(nChangePosInOut);
-        change.nValue += current_fee - fee_needed;
-        current_fee = result->GetSelectedValue() - CalculateOutputValue(txNew);
-        if (fee_needed != current_fee) {
-            return util::Error{Untranslated(STR_INTERNAL_BUG("Change adjustment: Fee needed != fee paid"))};
-        }
+        change.nValue += nFeeRet - fee_needed;
+        nFeeRet = fee_needed;
     }
 
     // Reduce output values for subtractFeeFromAmount
     if (coin_selection_params.m_subtract_fee_outputs) {
-        CAmount to_reduce = fee_needed - current_fee;
+        CAmount to_reduce = fee_needed - nFeeRet;
         int i = 0;
         bool fFirst = true;
         for (const auto& recipient : vecSend)
@@ -1013,16 +999,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
             }
             ++i;
         }
-        current_fee = result->GetSelectedValue() - CalculateOutputValue(txNew);
-        if (fee_needed != current_fee) {
-            return util::Error{Untranslated(STR_INTERNAL_BUG("SFFO: Fee needed != fee paid"))};
-        }
-    }
-
-    // fee_needed should now always be less than or equal to the current fees that we pay.
-    // If it is not, it is a bug.
-    if (fee_needed > current_fee) {
-        return util::Error{Untranslated(STR_INTERNAL_BUG("Fee needed > fee paid"))};
+        nFeeRet = fee_needed;
     }
 
     // Give up if change keypool ran out and change is required
@@ -1044,7 +1021,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         return util::Error{_("Transaction too large")};
     }
 
-    if (current_fee > wallet.m_default_max_tx_fee) {
+    if (nFeeRet > wallet.m_default_max_tx_fee) {
         return util::Error{TransactionErrorString(TransactionError::MAX_FEE_EXCEEDED)};
     }
 
@@ -1060,14 +1037,14 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     reservedest.KeepDestination();
 
     wallet.WalletLogPrintf("Fee Calculation: Fee:%d Bytes:%u Tgt:%d (requested %d) Reason:\"%s\" Decay %.5f: Estimation: (%g - %g) %.2f%% %.1f/(%.1f %d mem %.1f out) Fail: (%g - %g) %.2f%% %.1f/(%.1f %d mem %.1f out)\n",
-              current_fee, nBytes, feeCalc.returnedTarget, feeCalc.desiredTarget, StringForFeeReason(feeCalc.reason), feeCalc.est.decay,
+              nFeeRet, nBytes, feeCalc.returnedTarget, feeCalc.desiredTarget, StringForFeeReason(feeCalc.reason), feeCalc.est.decay,
               feeCalc.est.pass.start, feeCalc.est.pass.end,
               (feeCalc.est.pass.totalConfirmed + feeCalc.est.pass.inMempool + feeCalc.est.pass.leftMempool) > 0.0 ? 100 * feeCalc.est.pass.withinTarget / (feeCalc.est.pass.totalConfirmed + feeCalc.est.pass.inMempool + feeCalc.est.pass.leftMempool) : 0.0,
               feeCalc.est.pass.withinTarget, feeCalc.est.pass.totalConfirmed, feeCalc.est.pass.inMempool, feeCalc.est.pass.leftMempool,
               feeCalc.est.fail.start, feeCalc.est.fail.end,
               (feeCalc.est.fail.totalConfirmed + feeCalc.est.fail.inMempool + feeCalc.est.fail.leftMempool) > 0.0 ? 100 * feeCalc.est.fail.withinTarget / (feeCalc.est.fail.totalConfirmed + feeCalc.est.fail.inMempool + feeCalc.est.fail.leftMempool) : 0.0,
               feeCalc.est.fail.withinTarget, feeCalc.est.fail.totalConfirmed, feeCalc.est.fail.inMempool, feeCalc.est.fail.leftMempool);
-    return CreatedTransactionResult(tx, current_fee, nChangePosInOut, feeCalc);
+    return CreatedTransactionResult(tx, nFeeRet, nChangePosInOut, feeCalc);
 }
 
 util::Result<CreatedTransactionResult> CreateTransaction(

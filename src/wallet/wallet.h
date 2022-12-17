@@ -20,7 +20,6 @@
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <util/system.h>
-#include <util/time.h>
 #include <util/ui_change_type.h>
 #include <validationinterface.h>
 #include <wallet/crypter.h>
@@ -196,7 +195,7 @@ public:
     util::Result<CTxDestination> GetReservedDestination(bool internal);
     //! Return reserved address
     void ReturnDestination();
-    //! Keep the address. Do not return its key to the keypool when this object goes out of scope
+    //! Keep the address. Do not return it's key to the keypool when this object goes out of scope
     void KeepDestination();
 };
 
@@ -251,7 +250,7 @@ private:
     int nWalletVersion GUARDED_BY(cs_wallet){FEATURE_BASE};
 
     /** The next scheduled rebroadcast of wallet transactions. */
-    NodeClock::time_point m_next_resend{GetDefaultNextResend()};
+    int64_t m_next_resend{GetDefaultNextResend()};
     /** Whether this wallet will submit newly created transactions to the node's mempool and
      * prompt rebroadcasts (see ResendWalletTransactions()). */
     bool fBroadcastTransactions = false;
@@ -349,7 +348,7 @@ private:
      */
     static bool AttachChain(const std::shared_ptr<CWallet>& wallet, interfaces::Chain& chain, const bool rescan_required, bilingual_str& error, std::vector<bilingual_str>& warnings);
 
-    static NodeClock::time_point GetDefaultNextResend();
+    static int64_t GetDefaultNextResend();
 
 public:
     /**
@@ -402,6 +401,7 @@ public:
     TxItems wtxOrdered;
 
     int64_t nOrderPosNext GUARDED_BY(cs_wallet) = 0;
+    uint64_t nAccountingEntryNumber = 0;
 
     std::map<CTxDestination, CAddressBookData> m_address_book GUARDED_BY(cs_wallet);
     const CAddressBookData* FindAddressBookEntry(const CTxDestination&, bool allow_change = false) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

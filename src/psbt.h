@@ -875,7 +875,7 @@ struct PSBTOutput
                             throw std::ios_base::failure("Output Taproot tree has a leaf with an invalid leaf version");
                         }
                         m_tap_tree.push_back(std::make_tuple(depth, leaf_ver, script));
-                        builder.Add((int)depth, script, (int)leaf_ver, /*track=*/true);
+                        builder.Add((int)depth, script, (int)leaf_ver, true /* track */);
                     }
                     if (!builder.IsComplete()) {
                         throw std::ios_base::failure("Output Taproot tree is malformed");
@@ -1218,11 +1218,8 @@ std::string PSBTRoleName(PSBTRole role);
 /** Compute a PrecomputedTransactionData object from a psbt. */
 PrecomputedTransactionData PrecomputePSBTData(const PartiallySignedTransaction& psbt);
 
-/** Checks whether a PSBTInput is already signed by checking for non-null finalized fields. */
+/** Checks whether a PSBTInput is already signed. */
 bool PSBTInputSigned(const PSBTInput& input);
-
-/** Checks whether a PSBTInput is already signed by doing script verification using final fields. */
-bool PSBTInputSignedAndVerified(const PartiallySignedTransaction psbt, unsigned int input_index, const PrecomputedTransactionData* txdata);
 
 /** Signs a PSBTInput, verifying that all provided data matches what is being signed.
  *
